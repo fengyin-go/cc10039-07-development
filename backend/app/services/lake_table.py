@@ -52,7 +52,44 @@ class LakeTableService(BaseModuleService):
         entry["pending"] = False
         entry["abnormal"] = False
 
-        # 3) 通知冷热分层模块
+        # 3) 消费冷热分层的分层候选清单：按（表名，业务域）双键匹配，
+        #    表名相同但业务域不同的分区不能互借候选。
+        #    登记下次迁移可用分区（冷层）和本次归类使用的日期，
+        #    判定明细里保留当时的判定阈值，供登记页查回核对。
+        domain = entry.get("所属业务域", "")
+        candidates = [
+            c for c in store.extra_rows("tier_candidate")
+            if c.get("表名") == table_name and c.get("业务域") == domain
+        ]
+        if candidates:
+            migratable = sorted(
+                str(c.get("分区", "")) for c in candidates if c.get("温层") == "冷层"
+            )
+            entry["分层登记"] = {
+                "归类日期": max(str(c.get("归类日期", "")) for c in candidates),
+                "下次迁移可用分区": migratable,
+                "候选分区数": len(candidates),
+                "判定明细": [
+                    {
+                        "分区": c.get("分区", ""),
+                        "温层": c.get("温层", ""),
+                        "归类日期": c.get("归类日期", ""),
+                        "热层阈值": c.get("热层阈值", ""),
+                        "冷层阈值": c.get("冷层阈值", ""),
+                    }
+                    for c in sorted(candidates, key=lambda x: str(x.get("分区", "")))
+                ],
+            }
+            store.log_event("lake_table_tier_candidates", "lake_table", "storage_tier", {
+                "table_id": entry_id,
+                "table_name": table_name,
+                "domain": domain,
+                "candidate_count": len(candidates),
+                "migratable_partitions": migratable,
+                "as_of_date": entry["分层登记"]["归类日期"],
+            })
+
+        # 4) 通知冷热分层模块
         tiers = store.find_by_field("storage_tier", "生效湖表", table_name)
         if not tiers:
             store.log_event("lake_table_needs_tier", "lake_table", "storage_tier", {

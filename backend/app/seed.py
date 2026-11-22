@@ -1,7 +1,13 @@
 """示例数据：每个模块给几条不同状态的记录，方便起服务后立刻看到内容。"""
 from __future__ import annotations
 
+import datetime
 from typing import Any
+
+
+def _days_ago(days: int) -> str:
+    """相对今天的日期，保证分区账期样例随当前日期滚动。"""
+    return (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
 
 SEED_ROWS: dict[str, list[dict[str, Any]]] = {
     "partition_policy": [{'id': 1,
@@ -544,4 +550,17 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
   '优化建议': '治理报告样例3',
   '执行状态': '治理报告样例3',
   '审批状态': '治理报告样例3'}]
+}
+
+# 内部数据集：不是业务模块，不进概览统计。
+# partition_data —— 已有分区数据（含数据批次，补数会追加当天批次）；
+# tier_candidate —— 冷热分层归类产出的分层候选清单，由湖表注册消费。
+SEED_EXTRAS: dict[str, list[dict[str, Any]]] = {
+    "partition_data": [
+        # 账期刚过 30 天（相对冷层阈值 30 天），用于验收冷层判定
+        {"id": 1, "表名": "订单事实表", "业务域": "交易域", "账期": _days_ago(31), "批次": [_days_ago(31)]},
+        {"id": 2, "表名": "订单事实表", "业务域": "交易域", "账期": _days_ago(10), "批次": [_days_ago(10)]},
+        {"id": 3, "表名": "订单事实表", "业务域": "交易域", "账期": _days_ago(3), "批次": [_days_ago(3)]},
+    ],
+    "tier_candidate": [],
 }

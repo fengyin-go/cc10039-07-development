@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import datetime
+
 import pytest
 import sys
 import os
@@ -189,6 +191,162 @@ class TestStorageTier:
             assert entry is not None
             assert isinstance(msg, str)
             break
+
+
+class TestTierCandidate:
+    """冷热分层候选清单：归类 → 候选 → 湖表注册核验消费。
+
+    验收场景：冷层阈值设为 30 天，选账期刚过 30 天的分区，再向该分区
+    补写当天一笔；先执行归类，再让湖表注册消费清单，从登记详情核对
+    可迁移分区、计算使用的日期及温层。
+    """
+
+    def setup_method(self):
+        self.tier_svc = StorageTierService()
+        self.lake_svc = LakeTableService()
+        self.today = datetime.date.today()
+        # 账期刚过 30 天（31 天前）
+        self.old_period = (self.today - datetime.timedelta(days=31)).isoformat()
+
+    def _make_policy(self, table: str, hot: str = "7", cold: str = "30") -> dict:
+        entry, missing = self.tier_svc.create_entry({
+            "策略名称": f"分层策略-{table}",
+            "热层阈值": hot,
+            "冷层阈值": cold,
+            "迁移目标": "冷存储",
+            "生效湖表": table,
+        })
+        assert not missing
+        assert entry is not None
+        return entry
+
+    def _register_lake_table(self, table: str, domain: str) -> dict:
+        entry, missing = self.lake_svc.create_entry({
+            "表名": table,
+            "所属业务域": domain,
+            "存储格式": "Parquet",
+        })
+        assert not missing
+        registered, msg = self.lake_svc.register_table(entry["id"])
+        assert registered is not None, msg
+        return registered
+
+    def test_classify_then_register_consumes_candidates(self):
+        """主验收流：归类 → 候选清单 → 湖表注册消费 → 登记详情可核对。"""
+        table, domain = "验收订单表", "交易验收域"
+
+        # 1) 冷层阈值 30 天的分层策略
+        policy = self._make_policy(table)
+
+        # 2) 已有分区：账期刚过 30 天
+        part, msg = self.tier_svc.register_partition(table, domain, self.old_period)
+        assert part is not None, msg
+
+        # 3) 向该分区补写当天一笔：同一分区出现两批时间不同的数据
+        part, msg = self.tier_svc.backfill_partition(table, domain, self.old_period)
+        assert part is not None, msg
+        assert self.today.isoformat() in part["批次"]
+        assert len(part["批次"]) == 2
+
+        # 4) 先执行归类：整片分区按账期口径判定，不受当天补数影响
+        _, msg = self.tier_svc.classify_partitions(policy["id"])
+        candidates = self.tier_svc.list_candidates(table, domain)
+        assert len(candidates) == 1
+        cand = candidates[0]
+        assert cand["温层"] == "冷层"  # 账期 31 天 > 冷层阈值 30 天
+        assert cand["归类日期"] == self.today.isoformat()
+        assert cand["热层阈值"] == 7
+        assert cand["冷层阈值"] == 30
+
+        # 5) 规则重复提交只记一次候选，同一分区仍只落一个温层
+        _, msg = self.tier_svc.classify_partitions(policy["id"])
+        candidates = self.tier_svc.list_candidates(table, domain)
+        assert len(candidates) == 1
+        assert candidates[0]["温层"] == "冷层"
+
+        # 6) 湖表注册消费清单：登记详情核对可迁移分区、归类日期及温层
+        registered = self._register_lake_table(table, domain)
+        reg = registered.get("分层登记")
+        assert reg is not None, "注册详情应包含分层登记"
+        assert reg["归类日期"] == self.today.isoformat()
+        assert reg["下次迁移可用分区"] == [self.old_period]
+        assert reg["候选分区数"] == 1
+        detail = reg["判定明细"][0]
+        assert detail["分区"] == self.old_period
+        assert detail["温层"] == "冷层"
+        assert detail["热层阈值"] == 7
+        assert detail["冷层阈值"] == 30
+
+    def test_same_table_name_different_domain_no_borrow(self):
+        """表名相同但业务域不同的分区不能互借候选。"""
+        table = "域隔离订单表"
+        policy = self._make_policy(table)
+        self.tier_svc.register_partition(table, "域A", self.old_period)
+        self.tier_svc.classify_partitions(policy["id"])
+        assert len(self.tier_svc.list_candidates(table, "域A")) == 1
+
+        # 同表名、不同业务域的湖表注册时不应读到域A的候选
+        registered = self._register_lake_table(table, "域B")
+        assert "分层登记" not in registered
+
+        # 域A的湖表注册时能读到
+        registered_a = self._register_lake_table(table, "域A")
+        assert registered_a["分层登记"]["候选分区数"] == 1
+
+    def test_backfill_does_not_change_partition_tier(self):
+        """补数后同一分区仍按账期口径归类，整片只落一个温层。"""
+        table, domain = "补数口径表", "口径域"
+        policy = self._make_policy(table)
+        self.tier_svc.register_partition(table, domain, self.old_period)
+        # 补写当天一批后再归类
+        self.tier_svc.backfill_partition(table, domain, self.old_period)
+        self.tier_svc.classify_partitions(policy["id"])
+
+        candidates = self.tier_svc.list_candidates(table, domain)
+        assert len(candidates) == 1
+        assert candidates[0]["温层"] == "冷层"
+        assert len(candidates[0]["数据批次"]) == 2  # 批次情况留痕，但判定不变
+
+    def test_warm_and_hot_tier_boundaries(self):
+        """温层边界：账期年龄 ≤ 热层阈值判热层，≤ 冷层阈值判温层。"""
+        table, domain = "边界判定表", "边界域"
+        policy = self._make_policy(table)
+        warm_period = (self.today - datetime.timedelta(days=10)).isoformat()
+        hot_period = (self.today - datetime.timedelta(days=3)).isoformat()
+        self.tier_svc.register_partition(table, domain, self.old_period)
+        self.tier_svc.register_partition(table, domain, warm_period)
+        self.tier_svc.register_partition(table, domain, hot_period)
+        self.tier_svc.classify_partitions(policy["id"])
+
+        tiers = {
+            c["分区"]: c["温层"]
+            for c in self.tier_svc.list_candidates(table, domain)
+        }
+        assert tiers[self.old_period] == "冷层"
+        assert tiers[warm_period] == "温层"
+        assert tiers[hot_period] == "热层"
+
+        # 注册后只有冷层分区进入下次迁移可用分区
+        registered = self._register_lake_table(table, domain)
+        assert registered["分层登记"]["下次迁移可用分区"] == [self.old_period]
+        assert registered["分层登记"]["候选分区数"] == 3
+
+    def test_classify_rejects_invalid_thresholds(self):
+        """热层阈值必须小于冷层阈值，否则归类被拒绝。"""
+        table = "阈值校验表"
+        policy = self._make_policy(table, hot="30", cold="30")
+        entry, msg = self.tier_svc.classify_partitions(policy["id"])
+        assert entry is None
+        assert "阈值" in msg
+
+    def test_classify_action_via_run_action(self):
+        """通过动作入口执行归类（对应页面「执行归类」按钮）。"""
+        table, domain = "动作归类表", "动作域"
+        policy = self._make_policy(table)
+        self.tier_svc.register_partition(table, domain, self.old_period)
+        entry, msg = self.tier_svc.run_action(policy["id"], "执行归类")
+        assert entry is not None, msg
+        assert len(self.tier_svc.list_candidates(table, domain)) == 1
 
 
 class TestRetentionMgr:

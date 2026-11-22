@@ -9,13 +9,17 @@ import copy
 import datetime
 from typing import Any
 
-from app.seed import SEED_ROWS
+from app.seed import SEED_EXTRAS, SEED_ROWS
 
 
 class Store:
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
+        }
+        # 内部数据集（分区数据、分层候选清单等）：不是业务模块，不进概览统计
+        self._extras: dict[str, list[dict[str, Any]]] = {
+            name: [dict(row) for row in rows] for name, rows in SEED_EXTRAS.items()
         }
         # 跨模块事件日志：记录所有跨模块操作
         self._events: list[dict[str, Any]] = []
@@ -29,6 +33,10 @@ class Store:
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
+
+    def extra_rows(self, name: str) -> list[dict[str, Any]]:
+        """内部数据集读写：与业务模块隔离，不出现在模块概览里。"""
+        return self._extras.setdefault(name, [])
 
     def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
         for row in self.rows(module):

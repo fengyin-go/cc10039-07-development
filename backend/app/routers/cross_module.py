@@ -2,9 +2,11 @@
 
 提供 /api/cross/events, /api/cross/snapshots, /api/cross/pipeline-status 等端点，
 让前端和治理报告可以消费跨模块链路数据。
+/api/cross/tier/* 一组端点承载冷热分层的分区数据登记、补数、归类和候选清单查询。
 """
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -54,6 +56,74 @@ def list_snapshots() -> dict[str, Any]:
 def cross_module_overview() -> dict[str, Any]:
     """跨模块统计概览。"""
     return store.cross_module_stats()
+
+
+# ---- 冷热分层：分区数据、补数、归类与候选清单 ----
+
+@router.get("/tier/partitions")
+def list_partition_data(
+    table_name: str | None = Query(default=None),
+    domain: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """查询已有分区数据及其数据批次。"""
+    rows = list(store.extra_rows("partition_data"))
+    if table_name:
+        rows = [r for r in rows if r.get("表名") == table_name]
+    if domain:
+        rows = [r for r in rows if r.get("业务域") == domain]
+    return {"total": len(rows), "items": rows}
+
+
+@router.post("/tier/partitions")
+def register_partition(payload: dict[str, Any]) -> dict[str, Any]:
+    """登记已有分区数据：表名、业务域、账期必填，批次时间默认取账期当天。"""
+    svc = StorageTierService()
+    entry, message = svc.register_partition(
+        payload.get("表名"), payload.get("业务域"),
+        payload.get("账期"), payload.get("批次时间"),
+    )
+    return {"ok": entry is not None, "message": message, "entry": entry}
+
+
+@router.post("/tier/partitions/backfill")
+def backfill_partition(payload: dict[str, Any]) -> dict[str, Any]:
+    """向已有分区补写一批数据（默认当天），模拟补数场景。"""
+    svc = StorageTierService()
+    entry, message = svc.backfill_partition(
+        payload.get("表名"), payload.get("业务域"),
+        payload.get("账期"), payload.get("批次时间"),
+    )
+    return {"ok": entry is not None, "message": message, "entry": entry}
+
+
+@router.post("/tier/classify")
+def classify_tier(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行归类：按热层/冷层阈值对分区做温层判定，产出分层候选清单。"""
+    svc = StorageTierService()
+    try:
+        policy_id = int(payload.get("policy_id") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "policy_id 必须是整数"}
+    as_of = None
+    raw_as_of = str(payload.get("as_of_date") or "").strip()
+    if raw_as_of:
+        try:
+            as_of = datetime.date.fromisoformat(raw_as_of)
+        except ValueError:
+            return {"ok": False, "message": f"归类日期 {raw_as_of} 不是有效日期（YYYY-MM-DD）"}
+    entry, message = svc.classify_partitions(policy_id, as_of)
+    return {"ok": entry is not None, "message": message}
+
+
+@router.get("/tier/candidates")
+def list_tier_candidates(
+    table_name: str | None = Query(default=None),
+    domain: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """查询分层候选清单：温层判定、归类日期和判定时的阈值。"""
+    svc = StorageTierService()
+    rows = svc.list_candidates(table_name, domain)
+    return {"total": len(rows), "items": rows}
 
 
 @router.get("/pipeline-status")

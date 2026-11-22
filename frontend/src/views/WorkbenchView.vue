@@ -60,6 +60,14 @@
             >
               {{ action }}
             </button>
+            <button
+              class="link"
+              type="button"
+              :data-testid="`detail-${row.id}`"
+              @click="viewDetail(row)"
+            >
+              详情
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -86,6 +94,24 @@
       </form>
     </div>
 
+    <div v-if="detailEntry" class="modal-backdrop" data-testid="detail-modal">
+      <div class="modal">
+        <h3>{{ meta.entity }}详情</h3>
+        <dl class="detail-list">
+          <template v-for="(value, key) in detailEntry" :key="key">
+            <dt>{{ key }}</dt>
+            <dd>
+              <pre v-if="isStructured(value)" class="detail-json">{{ formatStructured(value) }}</pre>
+              <span v-else>{{ value ?? '—' }}</span>
+            </dd>
+          </template>
+        </dl>
+        <div class="page-actions">
+          <button class="btn" data-testid="close-detail" type="button" @click="detailEntry = null">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -99,6 +125,7 @@ import { computed, onMounted, ref } from 'vue'
 import {
   createEntry,
   downloadEntries,
+  getEntry,
   listEntries,
   moduleMeta,
   runAction as applyAction,
@@ -115,6 +142,7 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const detailEntry = ref<Record<string, unknown> | null>(null)
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -173,6 +201,23 @@ async function runAction(action: string, row: EntryRow) {
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
+  }
+}
+
+function isStructured(value: unknown): boolean {
+  return typeof value === 'object' && value !== null
+}
+
+function formatStructured(value: unknown): string {
+  return JSON.stringify(value, null, 2)
+}
+
+async function viewDetail(row: EntryRow) {
+  errorMessage.value = ''
+  try {
+    detailEntry.value = await getEntry(meta.key, Number(row.id))
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '详情读取失败'
   }
 }
 

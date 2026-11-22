@@ -25,6 +25,12 @@ export async function createEntry(
   return await response.json()
 }
 
+export async function getEntry(key: string, id: number): Promise<Record<string, unknown>> {
+  const response = await request(`/api/${key}/${id}`)
+  if (!response.ok) throw new Error('业务详情读取失败')
+  return await response.json()
+}
+
 export async function runAction(
   key: string,
   id: number,
